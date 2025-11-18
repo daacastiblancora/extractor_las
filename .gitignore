@@ -46,13 +46,22 @@ unprocessed_file_*.txt
 .DS_Store
 Thumbs.db
 
-# Large data files (example LIS/LAS files)
-*.LIS
-*.lis
+# Large data files (example LAS/DLIS files)
+# Note: Test .lis files are tracked for validation
 *.las
 *.dlis
 *.DLIS
 
+# EXCEPT test files
+!13_LOS-CEDROS-1_1469_LIS_8418.LIS
+!13_TOCORAGUA-1_7658_83999_SEIS.lis
+
 # Temporary files
 *.tmp
 *.bak
+
+# Test directories
+test_input/
+test_output/
+test_state.txt
+test_unprocessed.txt
