@@ -46,9 +46,8 @@ unprocessed_file_*.txt
 .DS_Store
 Thumbs.db
 
-# Large data files (example LIS/LAS files)
-*.LIS
-*.lis
+# Large data files (example LAS/DLIS files)
+# Note: .lis files are now tracked in the repository
 *.las
 *.dlis
 *.DLIS
