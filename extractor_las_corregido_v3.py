@@ -48,6 +48,10 @@ try:
     # Suprimir warnings excesivos de lasio
     import warnings
     warnings.filterwarnings('ignore', module='lasio')
+    warnings.filterwarnings('ignore', message='.*wrapped files.*')
+    warnings.filterwarnings('ignore', message='.*HeaderItem.*')
+    # Suprimir warnings de dlisio también
+    warnings.filterwarnings('ignore', category=UserWarning)
 except ImportError:
     lasio = None
     logging.error("Librería 'lasio' no instalada. La extracción de archivos .las no será posible.")
@@ -204,16 +208,25 @@ def detect_file_format(path: Path) -> str:
     """
     Detecta el formato real del archivo basándose en su contenido, no solo en la extensión.
     Retorna: 'las', 'dlis', 'lis', 'unknown'
+
+    NUEVO ORDEN DE PRIORIDAD (arreglado):
+    1. Verificar archivos corruptos/incorrectos
+    2. Detectar LAS por extensión + contenido texto
+    3. Leer header binario
+    4. PRIMERO: Verificar firmas DLIS (antes que extensión)
+    5. SEGUNDO: Verificar estructura LIS
+    6. ÚLTIMO: Usar extensión como fallback
     """
     try:
         # Primero verificar si es un archivo con formato completamente incorrecto
         if is_corrupted_or_wrong_format(path):
             return 'unknown'
+
+        file_ext_lower = path.suffix.lower()
+
         # --- Prioridad 1: Detección de LAS basada en extensión y contenido de texto ---
         # Si la extensión sugiere que es un LAS, intentamos leerlo como texto primero.
         # Esto evita falsos positivos donde el contenido binario de un LAS se confunde con DLIS.
-        file_ext_lower = path.suffix.lower()
-        # Prioridad para extensiones .las y .dlas para ser tratados como texto
         if file_ext_lower.startswith('.las') or file_ext_lower.startswith('.dlas'):
             for encoding in ENCODINGS_TO_TRY:
                 try:
@@ -226,44 +239,12 @@ def detect_file_format(path: Path) -> str:
                 except (UnicodeDecodeError, PermissionError):
                     continue
 
-        # --- Prioridad 2: Si la extensión es .lis, es muy probable que sea LIS binario ---
-        # No lo tratamos como LAS de texto a menos que la detección binaria falle.
-        if file_ext_lower.startswith('.lis'):
-            logging.info(f"Extensión '{file_ext_lower}' sugiere formato LIS. Priorizando detección binaria LIS.")
-            # La lógica posterior se encargará de la detección binaria de LIS primero.
-
-        # Primero intentar leer como binario para detectar formatos binarios
+        # --- Prioridad 2: Leer header binario para detectar DLIS/LIS ---
         with path.open("rb") as f:
-            # Leer los primeros bytes para identificación
-            header = f.read(512)  # Aumentado a 512 bytes para mejor detección
+            header = f.read(512)
 
-            # Verificar si es un archivo DLIS
-            # Los archivos DLIS comienzan con SUL (Storage Unit Label) de 80 bytes
-
-            # --- REORDENADO: Verificar LIS primero si la extensión lo sugiere ---
-            if file_ext_lower.startswith('.lis'):
-                # Verificar si es un archivo LIS
-                # Los archivos LIS tienen un Physical Record Header de 4 bytes
-                if len(header) >= 4:
-                    try:
-                        # Intentar detectar estructura LIS
-                        # Physical Record Header: Length(2 bytes) + Attributes(1 byte) + Type(1 byte)
-                        prh_length = struct.unpack('>H', header[0:2])[0]
-                        prh_attributes = header[2]
-                        prh_type = header[3]
-
-                        # Los archivos LIS típicamente tienen longitudes de registro razonables (< 32KB)
-                        # y tipos de registro específicos
-                        if 4 <= prh_length <= 32768 and prh_type in range(0, 128):
-                            # Verificar si hay patrones LIS típicos
-                            if b'\x00\x00' in header[4:20] or b'\xFF' in header[4:20]:
-                                logging.info(f"'{path.name}' detectado como formato LIS (extensión y estructura PRH válidas)")
-                                return 'lis'
-                    except:
-                        pass # Si falla el unpack, no es LIS
-
-            # --- Detección de DLIS (ahora se ejecuta después de la comprobación prioritaria de LIS) ---
-            # SUL contiene: Sequence Number(4) + DLIS Version(5) + Storage Set ID(60) + Prev Offset(5) + Next Offset(5) + Checksum(1)
+            # --- CRÍTICO: Verificar DLIS PRIMERO (antes de considerar extensión) ---
+            # Esto evita que archivos DLIS con extensión .lis sean mal detectados
             if len(header) >= 80:
                 # Buscar patrones típicos de DLIS
                 sul_patterns = [
@@ -276,18 +257,23 @@ def detect_file_format(path: Path) -> str:
                 # Verificar patrones en el SUL
                 for pattern in sul_patterns:
                     if pattern in header[:80]:
-                        logging.info(f"'{path.name}' detectado como formato DLIS (patrón SUL encontrado)")
+                        if file_ext_lower.startswith('.lis'):
+                            logging.warning(f"'{path.name}' tiene extensión .lis pero es formato DLIS (extensión incorrecta)")
+                        else:
+                            logging.info(f"'{path.name}' detectado como formato DLIS (patrón SUL encontrado)")
                         return 'dlis'
 
                 # Buscar palabras clave DLIS más adelante en el header
                 dlis_keywords = [b'RECORD', b'FILE-HEADER', b'ORIGIN', b'CHANNEL', b'FRAME', b'EFLR', b'IFLR']
                 for keyword in dlis_keywords:
                     if keyword in header:
-                        logging.info(f"'{path.name}' detectado como formato DLIS (palabra clave: {keyword})")
+                        if file_ext_lower.startswith('.lis'):
+                            logging.warning(f"'{path.name}' tiene extensión .lis pero es formato DLIS (keyword: {keyword.decode('ascii', errors='ignore')})")
+                        else:
+                            logging.info(f"'{path.name}' detectado como formato DLIS (palabra clave: {keyword})")
                         return 'dlis'
 
-            # Verificar si es un archivo LIS
-            # Los archivos LIS tienen un Physical Record Header de 4 bytes
+            # --- AHORA SÍ: Verificar LIS (después de descartar DLIS) ---
             if len(header) >= 4:
                 try:
                     # Intentar detectar estructura LIS
@@ -303,8 +289,8 @@ def detect_file_format(path: Path) -> str:
                         if b'\x00\x00' in header[4:20] or b'\xFF' in header[4:20]:
                             logging.info(f"'{path.name}' detectado como formato LIS (estructura PRH válida)")
                             return 'lis'
-                except:
-                    pass
+                except Exception:
+                    pass # Si falla el unpack, no es LIS
 
                 # Patrones adicionales para LIS
                 lis_markers = [b'\x00\x00', b'\xFF\x00', b'\xFF\x01', b'\x01\x00']
@@ -441,6 +427,7 @@ def extract_metadata_from_las(path: Path) -> Optional[Dict[str, Any]]:
 
     las_file = None
     successful_encoding = "autodetect"
+    has_corrupt_data = False
 
     try:
         # El preprocesamiento puede ayudar a corregir archivos LAS con secciones ~A faltantes.
@@ -453,19 +440,45 @@ def extract_metadata_from_las(path: Path) -> Optional[Dict[str, Any]]:
 
         file_ref = processed_content if processed_content else str(path)
 
-        las_file = lasio.read(
-            file_ref,
-            ignore_data=False,
-            ignore_header_errors=True,
-            autodetect_encoding=True
-        )
-        successful_encoding = las_file.encoding
+        # Suprimir warnings verbose de lasio durante la lectura
+        import sys
+        import io
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+
+        try:
+            las_file = lasio.read(
+                file_ref,
+                ignore_data=False,
+                ignore_header_errors=True,
+                autodetect_encoding=True
+            )
+            successful_encoding = las_file.encoding
+        finally:
+            captured_warnings = sys.stderr.getvalue()
+            sys.stderr = old_stderr
+
+            # Detectar si hay líneas corruptas pero no mostrar todas
+            if "Line" in captured_warnings and len(captured_warnings) > 500:
+                has_corrupt_data = True
+                logging.warning(f"⚠️ Archivo LAS '{path.name}' contiene líneas con datos corruptos o caracteres inválidos (omitiendo detalles)")
+            elif captured_warnings.strip():
+                # Solo mostrar warnings si son cortos/relevantes
+                for line in captured_warnings.split('\n')[:3]:  # Máximo 3 líneas
+                    if line.strip() and 'wrapped' not in line.lower():
+                        logging.debug(line.strip())
+
         logging.info(f"Archivo LAS '{path.name}' leído exitosamente con lasio y codificación '{successful_encoding}'.")
     except Exception as e:
-        logging.warning(f"Intento inicial con lasio.read falló para '{path.name}': {e}")
+        error_msg = str(e)
+        if "wrapped" in error_msg.lower():
+            logging.warning(f"⚠️ Archivo LAS '{path.name}' usa formato wrapped - reintentando con engine='normal'")
+        else:
+            logging.warning(f"⚠️ Error inicial leyendo '{path.name}' - intentando modo alternativo")
+
         # --- INICIO: Lógica de Reintento ---
         try:
-            logging.info(f"Reintentando '{path.name}' con lasio, ignorando datos de curvas (ignore_data=True).")
+            logging.info(f"Reintentando '{path.name}' con lasio, ignorando datos de curvas")
             las_file = lasio.read(
                 str(path),
                 ignore_data=True,  # Ignorar la sección de datos (~A) que causa el error
@@ -473,9 +486,9 @@ def extract_metadata_from_las(path: Path) -> Optional[Dict[str, Any]]:
                 autodetect_encoding=True
             )
             successful_encoding = las_file.encoding
-            logging.info(f"Lectura de encabezado exitosa para '{path.name}' en el reintento.")
+            logging.info(f"Lectura de encabezado exitosa para '{path.name}' en el reintento")
         except Exception as e_retry:
-            logging.error(f"El reintento con ignore_data=True también falló para '{path.name}': {e_retry}", exc_info=True)
+            logging.error(f"⚠️ No se pudo leer '{path.name}' con lasio - usando fallback de texto")
             # Si el reintento falla, las_file sigue siendo None y se pasará al fallback de texto
             pass
         # --- FIN: Lógica de Reintento ---
@@ -744,7 +757,23 @@ def extract_metadata_from_lis(path: Path) -> Optional[Dict[str, Any]]:
 
         # Intentar leer el archivo LIS con dlisio.lis
         try:
-            with dlisio.lis.load(str(path)) as files:
+            # Suprimir output verbose de dlisio durante carga
+            import sys
+            import io
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()
+
+            try:
+                files_context = dlisio.lis.load(str(path))
+            finally:
+                captured_errors = sys.stderr.getvalue()
+                sys.stderr = old_stderr
+
+                # Solo mostrar si hay error crítico que impida lectura
+                if "critical" in captured_errors.lower() and "stopped" in captured_errors.lower():
+                    logging.warning(f"⚠️ Archivo LIS '{path.name}' tiene registros corruptos o incompletos (dlisio se detuvo prematuramente)")
+
+            with files_context as files:
                 metadata = {
                     "format": "LIS",
                     "header": {},
@@ -818,10 +847,15 @@ def extract_metadata_from_lis(path: Path) -> Optional[Dict[str, Any]]:
 
         except Exception as e:
             # Si dlisio.lis no puede leerlo, intentar extracción básica
-            logging.warning(f"dlisio.lis no pudo leer el archivo '{path.name}' como LIS. Error: {e}")
+            error_msg = str(e)
+
+            # Determinar si es corrupción o formato incorrecto
+            if "Too short" in error_msg or "Missing next PRH" in error_msg or "end-of-file" in error_msg:
+                logging.warning(f"⚠️ Archivo LIS '{path.name}' está corrupto o truncado - usando extracción parcial")
+            else:
+                logging.warning(f"⚠️ No se pudo procesar '{path.name}' como LIS - probando otros métodos")
 
             # Verificar si el archivo podría ser un LAS de texto con extensión incorrecta
-            # Intentar leerlo como texto primero
             try:
                 with path.open('r', encoding='utf-8', errors='ignore') as f:
                     content_sample = f.read(1024)
@@ -829,11 +863,11 @@ def extract_metadata_from_lis(path: Path) -> Optional[Dict[str, Any]]:
                     if '~V' in content_sample and '~W' in content_sample:
                         logging.info(f"El archivo '{path.name}' parece tener formato LAS. Intentando fallback a LAS.")
                         return extract_metadata_from_las(path)
-            except:
+            except Exception:
                 pass
 
             # Si no es LAS de texto, usar extracción básica
-            logging.info(f"Usando extracción básica para archivo LIS corrupto o no estándar: '{path.name}'")
+            logging.info(f"Usando extracción parcial de strings para '{path.name}'")
             return extract_basic_binary_info(path, "LIS")
 
     except Exception as e:
